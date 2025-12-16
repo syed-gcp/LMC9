@@ -1,0 +1,84 @@
+#!/bin/bash
+set -u # Exit if variables are undefined
+set -o pipefail # Fail if any command in a pipe fails
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+SOURCE_BUCKET="gs://<primary-archive-bucket>"
+DEST_BUCKET="gs://<secondary-archive-bucket>"
+LOG_FILE="/var/log/lemans/sync_job.log"
+LOCK_FILE="/tmp/lemans_sync.lock"
+
+# DT_USER is the local user Dynatrace OneAgent uses (usually dtuser)
+DT_USER="dtuser"
+
+# ==============================================================================
+# LOGGING FUNCTION
+# Formats logs as: [YYYY-MM-DD HH:MM:SS] [LEVEL] Message
+# ==============================================================================
+log() {
+    local level="$1"
+    local message="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# ==============================================================================
+# PRE-FLIGHT CHECKS
+# ==============================================================================
+log "INFO" "Starting LeMans Secondary Sync Job..."
+
+# Check for Lock File (Prevent Overlap)
+if [ -f "$LOCK_FILE" ]; then
+    PID=$(cat "$LOCK_FILE")
+    if ps -p "$PID" > /dev/null; then
+        log "ERROR" "Job is already running (PID: $PID). Aborting to prevent collision."
+        exit 1
+    else
+        log "WARN" "Stale lock file found. Removing and proceeding."
+        rm -f "$LOCK_FILE"
+    fi
+fi
+
+# Create new Lock File
+echo $$ > "$LOCK_FILE"
+
+# Ensure Log File is readable by Dynatrace
+if [ -f "$LOG_FILE" ]; then
+    # We use setfacl to give specific read access to dtuser without opening it to world
+    if command -v setfacl &> /dev/null; then
+        setfacl -m u:$DT_USER:r "$LOG_FILE"
+    else
+        chmod 644 "$LOG_FILE" # Fallback if ACLs unavailable
+    fi
+fi
+
+# ==============================================================================
+# EXECUTION
+# ==============================================================================
+
+# Trap errors to ensure lock file is removed even on failure
+trap 'rm -f "$LOCK_FILE"; log "INFO" "Cleaned up lock file."; exit' INT TERM EXIT
+
+log "INFO" "Initiating gcloud sync from $SOURCE_BUCKET to $DEST_BUCKET"
+
+# The Actual Command
+# 1. Capture Stderr and Stdout to log
+# 2. Use -c for checksum validation
+# 3. Use --delete-unmatched... to enforce mirroring
+if gcloud storage rsync "$SOURCE_BUCKET" "$DEST_BUCKET" \
+    --recursive \
+    --checksums-only \
+    --delete-unmatched-destination-objects \
+    >> "$LOG_FILE" 2>&1; then
+    
+    log "INFO" "Sync completed SUCCESSFULLY."
+    # Optional: Log specific metric for Dynatrace to scrape
+    echo "lemans.backup.status=1" >> "$LOG_FILE"
+
+else
+    log "ERROR" "Sync command FAILED. Check logs above for details."
+    echo "lemans.backup.status=0" >> "$LOG_FILE"
+    # Explicit exit 1 tells TWS the job failed
+    exit 1
+fi
